@@ -32,6 +32,13 @@ def generate_launch_description():
                         arguments=['-topic', 'robot_description'],
                         output='screen')
     
+    joint_state_publisher = Node(
+    package='joint_state_publisher',
+    executable='joint_state_publisher',
+    name='joint_state_publisher',
+    parameters=[{'use_sim_time': True}],
+)
+    
     # De Bridge configuratie
     bridge = Node(
         package='ros_gz_bridge',
@@ -41,6 +48,7 @@ def generate_launch_description():
             '/scan@sensor_msgs/msg/LaserScan@ignition.msgs.LaserScan',
             '/odom@nav_msgs/msg/Odometry@ignition.msgs.Odometry',
             '/tf@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
+            '/joint_states@sensor_msgs/msg/JointState[ignition.msgs.Model',
         ],
         output='screen'
     )
@@ -52,4 +60,5 @@ def generate_launch_description():
         gazebo,
         spawn_entity,
         bridge,
+        joint_state_publisher
     ])
