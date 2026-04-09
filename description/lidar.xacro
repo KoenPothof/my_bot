@@ -26,7 +26,7 @@
       <topic>/scan</topic>
       <visualize>true</visualize>
       <update_rate>10</update_rate>
-      <ray>
+      <lidar>
         <scan>
           <horizontal>
             <samples>270</samples>
@@ -45,7 +45,7 @@
          <mean>0.0</mean>
          <stddev>0.01</stddev>
          </noise>
-      </ray>
+      </lidar>
     </sensor>
 
     <plugin filename="libignition-gazebo-sensors-system.so"
