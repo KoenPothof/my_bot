@@ -22,7 +22,7 @@
   <gazebo reference="laser_link">
     <sensor type="gpu_lidar" name="laser_sensor">
       <pose>0 0 0 0 0 0</pose>
-       <always_on>true</always_on>
+       <always_on>1</always_on>
       <topic>/scan</topic>
       <visualize>true</visualize>
       <update_rate>10</update_rate>
@@ -46,15 +46,12 @@
          <stddev>0.01</stddev>
          </noise>
       </ray>
-      <!-- <plugin filename="libgazebo_ros_ray_sensor.so"
-        name="scan">
-        <ros>
-          <argument>/out:=scan</argument>
-        </ros>
-        <output_type>sensor_msgs/LaserScan</output_type>
-        <frame_name>laser_link</frame_name>
-        </plugin> -->
     </sensor>
+
+    <plugin filename="libignition-gazebo-sensors-system.so"
+        name="ignition::gazebo::systems::Sensors">
+       <render_engine>ogre2</render_engine>
+        </plugin>
     </gazebo>
 
 </robot>
