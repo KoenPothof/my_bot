@@ -3,5 +3,6 @@
 
     
    <xacro:include filename="robotcore.xacro"/>
+   <xacro:include filename="gazebo_control.xacro"/>
 
 </robot>
