@@ -29,8 +29,7 @@ def generate_launch_description():
 
     # De spawner node (Aangepast van spawn_entity.py naar create)
     spawn_entity = Node(package='ros_gz_sim', executable='create',
-                        arguments=['-topic', 'robot_description',
-                                   '-name', 'my_bot'],
+                        arguments=['-topic', 'robot_description'],
                         output='screen')
     
     # De Bridge configuratie
@@ -41,10 +40,11 @@ def generate_launch_description():
             '/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist',
             '/scan@sensor_msgs/msg/LaserScan@ignition.msgs.LaserScan',
             '/odom@nav_msgs/msg/Odometry@ignition.msgs.Odometry',
-            '/tf@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V',
+            '/tf@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
         ],
         output='screen'
     )
+
 
     # Alles lanceren
     return LaunchDescription([
