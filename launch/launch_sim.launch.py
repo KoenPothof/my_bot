@@ -28,6 +28,14 @@ def generate_launch_description():
                     get_package_share_directory('my_bot'), 'worlds', 'obstakels1.sdf')
                 }.items(),
              )
+    
+    twist_mux_params = os.path.join(package_name, 'config', 'twist_mux.yaml')
+    twist_mux = Node(
+        package='twist_mux',
+        executable='twist_mux',
+        parameters=[twist_mux_params, ['use_sim_time', True]],
+        remappings=[('/cmd_vel_out', '/diff_cont/cmd_vel_unstamped')]
+    )
 
     # De spawner node (Aangepast van spawn_entity.py naar create)
     spawn_entity = Node(package='ros_gz_sim', executable='create',
@@ -61,6 +69,7 @@ def generate_launch_description():
     return LaunchDescription([
         rsp,
         gazebo,
+        twist_mux,
         spawn_entity,
         bridge,
         joint_state_publisher
