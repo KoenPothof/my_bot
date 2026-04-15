@@ -33,8 +33,8 @@ class PatrolNode(Node):
         # Waypoints — pas aan naar jouw kaart
         waypoints = [
             self.make_pose(0.0, 0.0),   # origin (startpunt)
-            self.make_pose(2.0, 0.0),   # waypoint 2
-            self.make_pose(2.0, 2.0),   # waypoint 3
+            self.make_pose(4.0, 0.0),   # waypoint 2
+            self.make_pose(4.0, 2.0),   # waypoint 3
             self.make_pose(0.0, 2.0),   # waypoint 4
             self.make_pose(0.0, 0.0),   # terug naar origin
         ]
