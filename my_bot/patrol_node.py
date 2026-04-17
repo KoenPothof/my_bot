@@ -30,13 +30,27 @@ class PatrolNode(Node):
         return pose
 
     def send_waypoints(self):
-        # Waypoints — pas aan naar jouw kaart
+        # Yaw waarden:
+        # 0.0       = naar rechts (noord)
+        # math.pi/2 = naar boven (west)
+        # math.pi   = naar links (zuid)
+        # -math.pi/2 = naar beneden (oost)
+
         waypoints = [
-            self.make_pose(0.0, 0.0),   # origin (startpunt)
-            self.make_pose(4.0, 0.0),   # waypoint 2
-            self.make_pose(4.0, 2.0),   # waypoint 3
-            self.make_pose(0.0, 2.0),   # waypoint 4
-            self.make_pose(0.0, 0.0),   # terug naar origin
+            # Start bij origin
+            self.make_pose(0.0, 0.0, 0.0),
+
+            # Kamer linksboven inrijden
+            self.make_pose(8.0, -8.0, math.pi/2),
+
+
+            self.make_pose(7.0, 7.0, math.pi),
+
+            # Hoek rechtsboven, draai naar boven
+            self.make_pose(-7.0, -7.0, math.pi/2),  
+            
+            # Terug naar origin
+            self.make_pose(0.0, 0.0, 0.0),   
         ]
 
         goal = FollowWaypoints.Goal()
