@@ -16,6 +16,7 @@ class State:
     WAITING   = "wachten"    # robot is aangekomen bij een waypoint
     COMPLETED = "voltooid"   # alle waypoints zijn afgerond
     STOPPED   = "gestopt"    # handmatig gestopt door operator
+    ERROR     = "fout"       # onherstelbare fout tijdens de route
 
 
 class PatrolNode(Node):
@@ -69,7 +70,7 @@ class PatrolNode(Node):
             return
 
         # Alleen starten vanuit inactieve staten
-        valid_start_states = (State.IDLE, State.COMPLETED, State.STOPPED)
+        valid_start_states = (State.IDLE, State.COMPLETED, State.STOPPED, State.ERROR)
         if self._state not in valid_start_states:
             self.get_logger().warn(
                 f'Start genegeerd — robot is momenteel: {self._state}')
@@ -109,7 +110,7 @@ class PatrolNode(Node):
 
         if not goal_handle.accepted:
             self.get_logger().error('Nav2 heeft de route geweigerd')
-            self._set_state(State.IDLE)
+            self._set_state(State.ERROR)
             return
 
         self.get_logger().info('Route geaccepteerd — robot rijdt nu')
@@ -146,8 +147,8 @@ class PatrolNode(Node):
         elif self._state == State.STOPPED:
             self.get_logger().info('Route gestopt door operator')
         else:
-            self.get_logger().warn(f'Route afgebroken — status: {status}')
-            self._set_state(State.IDLE)
+            self.get_logger().error(f'Route mislukt — Nav2 status: {status}')
+            self._set_state(State.ERROR)
 
 
     # Waypoint aanmaken op basis van positie en richting
