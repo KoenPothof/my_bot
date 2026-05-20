@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+import signal
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -37,14 +39,18 @@ class PatrolNode(Node):
         self.create_subscription(Bool, '/start_patrol', self._on_start, 10)
         self.create_subscription(Bool, '/stop_patrol',  self._on_stop,  10)
 
-        # Waypoints definiëren — pas coördinaten aan naar jouw kaart
+        # Alleen echte bestemmingen — Nav2 plant zelf de route ertussen
         self._waypoints = [
-            self._make_pose(0.0, 0.0,  0.0),        # startpunt / origin
-            self._make_pose(3.0, 0.0,  0.0),        # punt 2 → rechts
-            self._make_pose(3.0, 3.0,  math.pi/2),  # punt 3 → omhoog
-            self._make_pose(0.0, 3.0,  math.pi),    # punt 4 → links
-            self._make_pose(0.0, 0.0, -math.pi/2),  # terug naar origin
+            self._make_pose(0.0, 0.0, 0.0),
+            self._make_pose(7.70654, -7.23268, 1.60696),  # patrouille punt
+            self._make_pose(0.0, 0.0, 0.0),               # terug naar basis
         ]
+
+        # Bijhouden welk waypoint als laatste gezien is in feedback
+        self._last_waypoint = -1
+
+        # Actief goal handle opslaan zodat we het kunnen cancellen
+        self._goal_handle = None
 
         # Beginstate publiceren zodat andere nodes direct de state kennen
         self._publish_state()
@@ -77,21 +83,35 @@ class PatrolNode(Node):
             return
 
         self.get_logger().info('Startsignaal ontvangen — route wordt gestart')
+        self._last_waypoint = -1
         self._set_state(State.PLANNING)
         self._send_waypoints()
 
 
     # Stopsignaal ontvangen via /stop_patrol
     def _on_stop(self, msg: Bool):
-        if msg.data and self._state == State.DRIVING:
+        if msg.data and self._state in (State.DRIVING, State.WAITING):
             self.get_logger().info('Stopsignaal ontvangen — route wordt onderbroken')
             self._set_state(State.STOPPED)
+            self._cancel_goal()
+
+    def _cancel_goal(self):
+        if self._goal_handle is not None:
+            self.get_logger().info('Nav2 goal wordt gecanceld')
+            cancel_future = self._goal_handle.cancel_goal_async()
+            self._goal_handle = None
+            # Wacht max 2 seconden tot Nav2 de cancel bevestigt
+            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=2.0)
+            self.get_logger().info('Nav2 goal gecanceld')
 
 
     # Waypoints opsturen naar Nav2 en wachten op bevestiging
     def _send_waypoints(self):
         self.get_logger().info('Wacht tot Nav2 beschikbaar is...')
-        self._action_client.wait_for_server()
+        if not self._action_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Nav2 niet beschikbaar na 5 seconden')
+            self._set_state(State.ERROR)
+            return
 
         goal       = FollowWaypoints.Goal()
         goal.poses = self._waypoints
@@ -114,6 +134,7 @@ class PatrolNode(Node):
             return
 
         self.get_logger().info('Route geaccepteerd — robot rijdt nu')
+        self._goal_handle = goal_handle
         self._set_state(State.DRIVING)
 
         # Wachten op het eindresultaat van de route
@@ -123,17 +144,20 @@ class PatrolNode(Node):
 
     # Tussentijdse update over het huidige waypoint ontvangen
     def _on_feedback(self, feedback_msg):
+        if self._state not in (State.DRIVING, State.WAITING):
+            return
+
         current = feedback_msg.feedback.current_waypoint
         total   = len(self._waypoints)
 
-        if self._state == State.DRIVING:
-            self._set_state(State.WAITING)
-            self.get_logger().info(
-                f'Waypoint {current + 1} van {total} bereikt — even wachten')
-        elif self._state == State.WAITING:
-            self._set_state(State.DRIVING)
-            self.get_logger().info(
-                f'Verder rijden naar waypoint {current + 1} van {total}')
+        # Nav2 stuurt feedback continu — alleen reageren als waypoint-index verandert
+        if current == self._last_waypoint:
+            return
+
+        self._last_waypoint = current
+        self._set_state(State.WAITING)
+        self.get_logger().info(f'Waypoint {current} van {total} bereikt — verder naar {current + 1}')
+        self._set_state(State.DRIVING)
 
 
     # Eindresultaat van de route verwerken
@@ -168,9 +192,20 @@ class PatrolNode(Node):
 def main():
     rclpy.init()
     node = PatrolNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+
+    # SIGINT (Ctrl+C) zelf afvangen — cancel eerst, dan pas afsluiten
+    def _on_shutdown(signum, frame):
+        node.get_logger().info('Afsluiten — wacht op Nav2 cancel...')
+        node._cancel_goal()
+        rclpy.shutdown()
+
+    signal.signal(signal.SIGINT,  _on_shutdown)
+    signal.signal(signal.SIGTERM, _on_shutdown)
+
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
 
 
 if __name__ == '__main__':

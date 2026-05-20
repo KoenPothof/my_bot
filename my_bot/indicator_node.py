@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path, Odometry
@@ -7,8 +8,13 @@ import math
 
 
 # Drempelwaarden — pas aan naar jouw situatie
-TURN_THRESHOLD_DEGREES = 15.0   # hoeveel graden afwijking = omweg
-SPEED_THRESHOLD        = 0.05   # m/s — onder deze snelheid staat de robot stil
+TURN_THRESHOLD_DEGREES  = 45.0  # hoeveel graden afwijking = scherpe bocht (via /plan)
+TURN_ROTATION_THRESHOLD = 0.20  # rad/s — knipperlicht AAN boven deze waarde
+TURN_OFF_THRESHOLD      = 0.17  # rad/s — knipperlicht UIT onder deze waarde (hysteresis)
+SPEED_THRESHOLD         = 0.05  # m/s — onder deze snelheid staat de robot stil
+MIN_BLINKER_DURATION    = 2.0   # seconden — minimale brandtijd van de blinker
+HAZARD_DELAY            = 1.2   # seconden stilstand voor gevaarslichten aangaan
+LOOKAHEAD_FRACTION      = 0.6   # vooruitkijken: eerste 60% van het pad
 
 
 class IndicatorNode(Node):
@@ -21,6 +27,9 @@ class IndicatorNode(Node):
         self._detour_active = False
         self._direction     = 'uit'
         self._current_speed = 0.0
+        self._hazard_on     = False
+        self._still_since   = None  # tijdstip waarop robot stil ging staan
+        self._activated_at  = None  # tijdstip waarop blinker aanging
 
         # Subscribers aanmaken
         self.create_subscription(String,   '/patrol_state', self._on_patrol_state, 10)
@@ -35,6 +44,9 @@ class IndicatorNode(Node):
 
         # Timer voor het publiceren van de status
         self.create_timer(0.5, self._publish_status)
+
+        # Timer voor gevaarslichten wanneer robot stilstaat
+        self.create_timer(2.0, self._blink_hazard)
 
         self.get_logger().info('IndicatorNode gestart — wacht op /patrol_state')
 
@@ -59,6 +71,19 @@ class IndicatorNode(Node):
         vy = msg.twist.twist.linear.y
         self._current_speed = math.sqrt(vx**2 + vy**2)
 
+        # Bijhouden vanaf wanneer de robot stilstaat
+        if self._current_speed < SPEED_THRESHOLD:
+            if self._still_since is None:
+                self._still_since = self.get_clock().now()
+        else:
+            self._still_since = None
+            if self._hazard_on:
+                self._hazard_on = False
+                indicator_msg      = String()
+                indicator_msg.data = 'uit'
+                self._indicator_pub.publish(indicator_msg)
+                self.get_logger().info('Gevaarslichten UIT — robot rijdt weer')
+
 
     # ── Bocht detecteren via rijcommando ──
     def _on_cmd_vel(self, msg: Twist):
@@ -69,19 +94,16 @@ class IndicatorNode(Node):
         rotation = msg.angular.z
         speed    = msg.linear.x
 
-        # Robot beweegt én draait tegelijk — dit is een bocht
-        if abs(speed) > SPEED_THRESHOLD and abs(rotation) > 0.1:
+        self.get_logger().debug(f'cmd_vel: speed={speed:.2f} rotation={rotation:.2f}')
+
+        if abs(speed) > SPEED_THRESHOLD and abs(rotation) > TURN_ROTATION_THRESHOLD:
+            # Bocht — knipperlicht aan
             direction = 'links' if rotation > 0 else 'rechts'
             if not self._detour_active or self._direction != direction:
-                self.get_logger().info(
-                    f'Bocht gedetecteerd via /cmd_vel: {direction} '
-                    f'(rotatie: {rotation:.2f} rad/s)')
                 self._activate(direction)
-        else:
-            # Geen rotatie meer — bocht voorbij
-            if self._detour_active:
-                self.get_logger().info('Bocht voorbij — indicatoren uit')
-                self._deactivate()
+        elif self._detour_active and abs(rotation) < TURN_OFF_THRESHOLD:
+            # Rotatie onder 0.17 — bocht voorbij, knipperlicht uit (na min. 2s)
+            self._deactivate()
 
 
     # ── Omweg detecteren via gepland pad ──
@@ -96,15 +118,10 @@ class IndicatorNode(Node):
         # Bereken of het pad een bocht bevat
         is_detour, direction = self._calculate_detour(msg)
 
+        # Plan zet alleen AAN — uitzetten gebeurt via cmd_vel (bocht is écht voorbij)
         if is_detour:
             if not self._detour_active or self._direction != direction:
-                self.get_logger().info(
-                    f'Omweg gedetecteerd via /plan: {direction}')
                 self._activate(direction)
-        else:
-            if self._detour_active:
-                self.get_logger().info('Pad is recht — indicatoren uit')
-                self._deactivate()
 
 
     # ── Hoekverandering berekenen langs het pad ──
@@ -117,9 +134,11 @@ class IndicatorNode(Node):
         poses = path.poses
         n     = len(poses)
 
-        # Drie referentiepunten langs het pad
+        # Kijk alleen naar het voorste deel van het pad (vroeg detecteren)
+        lookahead = max(3, int(n * LOOKAHEAD_FRACTION))
+        poses  = poses[:lookahead]
         start  = poses[0].pose.position
-        middle = poses[n // 2].pose.position
+        middle = poses[len(poses) // 2].pose.position
         end    = poses[-1].pose.position
 
         # Hoek van start naar midden en van midden naar eind
@@ -139,29 +158,64 @@ class IndicatorNode(Node):
         return False, 'uit'
 
 
+    # ── Gevaarslichten knipperen wanneer robot stilstaat ──
+    def _blink_hazard(self):
+        actief_rijdend = self._patrol_state in ('rijdend', 'wachten')
+
+        if self._still_since is None or self._detour_active or not actief_rijdend:
+            return
+
+        stil_seconden = (self.get_clock().now() - self._still_since).nanoseconds / 1e9
+        if stil_seconden < HAZARD_DELAY:
+            return
+
+        self._hazard_on = not self._hazard_on
+        status = 'AAN' if self._hazard_on else 'UIT'
+        self.get_logger().info(f'Gevaarslichten {status} — robot staat stil')
+
+        indicator_msg      = String()
+        indicator_msg.data = 'gevaar' if self._hazard_on else 'uit'
+        self._indicator_pub.publish(indicator_msg)
+
+
     # ── Buzzer en knipperlicht aanzetten ──
     def _activate(self, direction: str):
-        """Zet buzzer en knipperlicht aan in de opgegeven richting."""
         self._detour_active = True
         self._direction     = direction
+        self._activated_at  = self.get_clock().now()
 
+        # Buzzer kort aan — timer zet hem na 0.3s weer uit
         buzzer_msg      = Bool()
         buzzer_msg.data = True
         self._buzzer_pub.publish(buzzer_msg)
+
+        def _stop_buzzer():
+            off_msg      = Bool()
+            off_msg.data = False
+            self._buzzer_pub.publish(off_msg)
+            self.destroy_timer(buzzer_timer)
+
+        buzzer_timer = self.create_timer(0.3, _stop_buzzer)
 
         indicator_msg      = String()
         indicator_msg.data = direction
         self._indicator_pub.publish(indicator_msg)
 
         self.get_logger().info(
-            f'Buzzer AAN · Knipperlicht {direction.upper()} AAN')
+            f'Knipperlicht {direction.upper()} AAN — robot maakt bocht naar {direction}')
 
 
     # ── Buzzer en knipperlicht uitzetten ──
     def _deactivate(self):
-        """Zet buzzer en knipperlicht uit."""
+        # Wacht minimaal MIN_BLINKER_DURATION seconden voor uitzetten
+        if self._activated_at is not None:
+            aan_seconden = (self.get_clock().now() - self._activated_at).nanoseconds / 1e9
+            if aan_seconden < MIN_BLINKER_DURATION:
+                return
+
         self._detour_active = False
         self._direction     = 'uit'
+        self._activated_at  = None
 
         buzzer_msg      = Bool()
         buzzer_msg.data = False
@@ -171,7 +225,7 @@ class IndicatorNode(Node):
         indicator_msg.data = 'uit'
         self._indicator_pub.publish(indicator_msg)
 
-        self.get_logger().info('Buzzer UIT · Knipperlicht UIT')
+        self.get_logger().info('Knipperlicht UIT')
 
 
     # ── Huidige status publiceren voor monitoring ──
