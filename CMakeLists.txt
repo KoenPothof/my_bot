@@ -40,6 +40,8 @@ install(
 install(PROGRAMS
   my_bot/patrol_node.py
   my_bot/indicator_node.py
+  my_bot/environment_speed_node.py
+  my_bot/mqtt_hmi_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
