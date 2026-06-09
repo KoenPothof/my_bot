@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import signal
 import rclpy
-import rclpy.time
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
@@ -10,21 +9,16 @@ from std_msgs.msg import Bool, String
 from action_msgs.msg import GoalStatus
 import math
 
-
-FIRST_WAIT_SEC     = 120.0  # 2 minuten wachten voor eerste herpoging — geeft mensen tijd om aan de kant te gaan
-RETRY_INTERVAL_SEC = 30.0   # daarna elke 30 seconden opnieuw proberen
-BLOCK_TIMEOUT_SEC  = 180.0  # na 3 minuten totaal → volgend waypoint
+WACHT_SECONDEN = 180  # 3 minuten wachten bij blokkade
 
 
 class State:
-    IDLE      = "idle"          # wacht op startsignaal
-    PLANNING  = "planning"      # bezig met opsturen naar Nav2
-    DRIVING   = "rijdend"       # robot rijdt naar een waypoint
-    WAITING   = "wachten"       # korte pauze tussen waypoints
-    BLOCKED   = "geblokkeerd"   # weg geblokkeerd, wacht op vrije doorgang
-    COMPLETED = "voltooid"      # alle waypoints afgerond
-    STOPPED   = "gestopt"       # handmatig gestopt door operator
-    ERROR     = "fout"          # onherstelbare fout
+    IDLE      = "idle"
+    DRIVING   = "rijdend"
+    WAITING   = "wachten"
+    COMPLETED = "voltooid"
+    STOPPED   = "gestopt"
+    ERROR     = "fout"
 
 
 class PatrolNode(Node):
@@ -33,245 +27,200 @@ class PatrolNode(Node):
         super().__init__('patrol_node')
 
         self._state = State.IDLE
-
-        # NavigateToPose direct — zelfde als ros2 action send_goal /navigate_to_pose
         self._action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
-
         self._state_pub = self.create_publisher(String, '/patrol_state', 10)
 
         self.create_subscription(Bool, '/start_patrol', self._on_start, 10)
         self.create_subscription(Bool, '/stop_patrol',  self._on_stop,  10)
 
-        self._waypoint_coords = [
-            (0.0,   0.0,  0.0),
-            (0.64,  0.15, 0.0),
-            (-0.31, 1.38, 0.0),
-            (0.0,   0.0,  0.0),
+        self._waypoints = [
+            self._make_pose(-0.5, -0.5, 0.0),   # startpunt
+            self._make_pose(1.0,  0.0,  0.0),   # waypoint 1
+            self._make_pose(-0.5, -0.5, 0.0),   # terug naar start
         ]
 
-        self._current_waypoint = 0
-        self._goal_handle      = None
-        self._stop_requested   = False
-        self._next_timer       = None
-        self._retry_timer      = None
-        self._block_start_ns   = None   # tijdstip eerste blokkade (nanoseconden)
-        self._retreating       = False  # robot rijdt terug naar vorig waypoint
-        self._has_retreated    = False  # al één keer teruggereden geweest
+        self._current_index       = 0
+        self._last_successful_idx = 0
+        self._goal_handle         = None
+        self._stopped             = False
+        self._wait_timer          = None
+        self._trying_alternative  = False
 
         self._publish_state()
         self.get_logger().info('PatrolNode klaar — wacht op /start_patrol')
 
+    # ── State machine ─────────────────────────────────────────────────────────
+
     def _set_state(self, new_state: str):
-        old = self._state
+        old_state   = self._state
         self._state = new_state
         self._publish_state()
-        self.get_logger().info(f'[STATE] {old} → {new_state}')
+        self.get_logger().info(f'[STATE] {old_state} → {new_state}')
 
     def _publish_state(self):
         msg      = String()
         msg.data = self._state
         self._state_pub.publish(msg)
 
+    # ── Start / stop ──────────────────────────────────────────────────────────
+
     def _on_start(self, msg: Bool):
         if not msg.data:
             return
-        valid = (State.IDLE, State.COMPLETED, State.STOPPED, State.ERROR)
-        if self._state not in valid:
+        valid_start_states = (State.IDLE, State.COMPLETED, State.STOPPED, State.ERROR)
+        if self._state not in valid_start_states:
             self.get_logger().warn(f'Start genegeerd — robot is momenteel: {self._state}')
             return
         self.get_logger().info('Startsignaal ontvangen — route wordt gestart')
-        self._stop_requested   = False
-        self._current_waypoint = 0
-        self._block_start_ns   = None
-        self._retreating       = False
-        self._has_retreated    = False
-        self._set_state(State.PLANNING)
-        self._navigate_to_next()
+        self._current_index       = 0
+        self._last_successful_idx = 0
+        self._stopped             = False
+        self._trying_alternative  = False
+        self._navigate_to_current()
 
     def _on_stop(self, msg: Bool):
-        if msg.data and self._state in (State.DRIVING, State.WAITING, State.BLOCKED):
+        if msg.data and self._state not in (State.IDLE, State.STOPPED, State.COMPLETED, State.ERROR):
             self.get_logger().info('Stopsignaal ontvangen — route wordt onderbroken')
-            self._stop_requested = True
-            self._cancel_timers()
+            self._stopped = True
+            self._cancel_wait_timer()
             self._set_state(State.STOPPED)
             self._cancel_goal()
 
     def _cancel_goal(self):
         if self._goal_handle is not None:
-            self.get_logger().info('Nav2 goal wordt gecanceld')
-            cancel_future = self._goal_handle.cancel_goal_async()
+            cancel_future     = self._goal_handle.cancel_goal_async()
             self._goal_handle = None
             rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=2.0)
 
-    def _cancel_timers(self):
-        if self._next_timer is not None:
-            self._next_timer.cancel()
-            self._next_timer = None
-        if self._retry_timer is not None:
-            self._retry_timer.cancel()
-            self._retry_timer = None
+    def _cancel_wait_timer(self):
+        if self._wait_timer is not None:
+            self._wait_timer.cancel()
+            self._wait_timer = None
 
-    def _navigate_to_next(self):
-        if self._stop_requested:
-            return
+    # ── Navigatie ─────────────────────────────────────────────────────────────
 
-        total = len(self._waypoint_coords)
-        if self._current_waypoint >= total:
-            self.get_logger().info('Alle waypoints afgerond!')
-            self._block_start_ns = None
-            self._set_state(State.COMPLETED)
-            return
-
+    def _navigate_to_current(self):
         if not self._action_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error('Nav2 niet beschikbaar na 5 seconden')
             self._set_state(State.ERROR)
             return
-
-        x, y, yaw = self._waypoint_coords[self._current_waypoint]
 
         goal      = NavigateToPose.Goal()
-        goal.pose = self._make_pose(x, y, yaw)
+        goal.pose = self._waypoints[self._current_index]
 
+        label = 'alternatief waypoint' if self._trying_alternative else 'waypoint'
         self.get_logger().info(
-            f'Navigeer naar waypoint {self._current_waypoint + 1}/{total}: ({x:.2f}, {y:.2f})')
+            f'Navigeer naar {label} {self._current_index + 1} van {len(self._waypoints)}')
         self._set_state(State.DRIVING)
-
-        future = self._action_client.send_goal_async(
-            goal, feedback_callback=self._on_feedback)
-        future.add_done_callback(self._on_goal_response)
-
-    def _navigate_to_previous(self):
-        if self._stop_requested:
-            return
-
-        # Als er geen vorig waypoint is, blijf op huidige positie in BLOCKED state
-        if self._current_waypoint == 0:
-            self.get_logger().warn('Geen vorig waypoint beschikbaar — wacht op huidige positie')
-            self._retreating = False
-            self._set_state(State.BLOCKED)
-            self._retry_timer = self.create_timer(RETRY_INTERVAL_SEC, self._on_retry_timer)
-            return
-
-        if not self._action_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error('Nav2 niet beschikbaar na 5 seconden')
-            self._set_state(State.ERROR)
-            return
-
-        prev_index    = self._current_waypoint - 1
-        x, y, yaw     = self._waypoint_coords[prev_index]
-        goal          = NavigateToPose.Goal()
-        goal.pose     = self._make_pose(x, y, yaw)
-
-        self.get_logger().info(
-            f'Rijdt terug naar waypoint {prev_index + 1}: ({x:.2f}, {y:.2f})')
-
-        future = self._action_client.send_goal_async(
-            goal, feedback_callback=self._on_feedback)
+        future = self._action_client.send_goal_async(goal)
         future.add_done_callback(self._on_goal_response)
 
     def _on_goal_response(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
+            self.get_logger().error('Nav2 heeft het doel geweigerd')
+            self._on_blocked()
+            return
+        self._goal_handle = goal_handle
+        future            = goal_handle.get_result_async()
+        future.add_done_callback(self._on_result)
+
+    def _on_result(self, future):
+        if self._stopped:
+            return
+
+        status = future.result().status
+
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info(f'Waypoint {self._current_index + 1} bereikt')
+            self._last_successful_idx = self._current_index
+            self._trying_alternative  = False
+            self._set_state(State.WAITING)
+            self._current_index += 1
+
+            if self._current_index >= len(self._waypoints):
+                self.get_logger().info('Route succesvol afgerond!')
+                self._set_state(State.COMPLETED)
+            else:
+                self._navigate_to_current()
+        else:
+            self._on_blocked()
+
+    # ── Blokkade afhandeling ──────────────────────────────────────────────────
+
+    def _on_blocked(self):
+        if self._trying_alternative:
+            # Alternatieve route ook geblokkeerd → terugkeren en fout melden
+            self.get_logger().warn(
+                'Alternatieve route ook geblokkeerd — terugkeren naar vorige positie')
+            self._return_to_last()
+        else:
+            # Eerste blokkade → 3 minuten wachten zodat doorgang vrij kan komen
+            self.get_logger().warn(
+                f'Blokkade bij waypoint {self._current_index + 1} — '
+                f'wacht {WACHT_SECONDEN // 60} minuten op vrijgave doorgang')
+            self._set_state(State.WAITING)
+            self._wait_timer = self.create_timer(WACHT_SECONDEN, self._on_wacht_voorbij)
+
+    def _on_wacht_voorbij(self):
+        self._cancel_wait_timer()
+
+        if self._stopped:
+            return
+
+        # Na 3 minuten → probeer alternatieve route via volgend waypoint
+        next_index = self._current_index + 1
+        if next_index < len(self._waypoints):
+            self.get_logger().info(
+                f'Wachttijd voorbij — probeer alternatieve route via waypoint {next_index + 1}')
+            self._trying_alternative = True
+            self._current_index      = next_index
+            self._navigate_to_current()
+        else:
+            self.get_logger().warn(
+                'Geen alternatieve route beschikbaar — terugkeren naar vorige positie')
+            self._return_to_last()
+
+    # ── Terugkeren ────────────────────────────────────────────────────────────
+
+    def _return_to_last(self):
+        goal      = NavigateToPose.Goal()
+        goal.pose = self._waypoints[self._last_successful_idx]
+
+        self.get_logger().info(
+            f'Terugkeren naar waypoint {self._last_successful_idx + 1}')
+        self._set_state(State.RETURNING)
+        future = self._action_client.send_goal_async(goal)
+        future.add_done_callback(self._on_return_response)
+
+    def _on_return_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
             self.get_logger().error(
-                f'Waypoint {self._current_waypoint + 1} geweigerd door Nav2')
+                'FOUT: Kan niet terugkeren — operator ingrijpen vereist')
             self._set_state(State.ERROR)
             return
         self._goal_handle = goal_handle
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_result)
+        future            = goal_handle.get_result_async()
+        future.add_done_callback(self._on_return_result)
 
-    def _on_feedback(self, _feedback_msg):
-        pass
-
-    def _on_result(self, future):
-        if self._stop_requested:
-            return
-
-        result = future.result()
-        status = result.status
-        total  = len(self._waypoint_coords)
-
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            if self._retreating:
-                # Teruggereden naar vorig waypoint — één laatste poging, daarna ERROR
-                self._retreating    = False
-                self._has_retreated = True
-                self.get_logger().info(
-                    f'Terug bij waypoint {self._current_waypoint}/{total} — '
-                    f'één laatste poging naar waypoint {self._current_waypoint + 1}')
-                self._set_state(State.BLOCKED)
-                self._retry_timer = self.create_timer(RETRY_INTERVAL_SEC, self._on_retry_timer)
-            else:
-                self.get_logger().info(
-                    f'Waypoint {self._current_waypoint + 1}/{total} bereikt')
-                self._block_start_ns = None
-                self._has_retreated  = False
-                self._set_state(State.WAITING)
-                self._current_waypoint += 1
-                self._next_timer = self.create_timer(1.0, self._on_next_timer)
-
-        elif status in (GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_CANCELED):
-            self._handle_blockage()
-
+    def _on_return_result(self, future):
+        if future.result().status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().error(
+                'FOUT: Route mislukt — robot teruggekeerd naar vorige positie — '
+                'operator ingrijpen vereist')
         else:
             self.get_logger().error(
-                f'Waypoint {self._current_waypoint + 1} mislukt — status: {status}')
-            self._set_state(State.ERROR)
+                'FOUT: Route mislukt — kon ook niet terugkeren — '
+                'operator ingrijpen vereist')
+        self._set_state(State.ERROR)
 
-    def _handle_blockage(self):
-        if self._has_retreated:
-            self.get_logger().error(
-                f'Waypoint {self._current_waypoint + 1} nog steeds niet bereikbaar '
-                f'na terugrijden — route afgebroken')
-            self._set_state(State.ERROR)
-            return
-
-        now_ns = self.get_clock().now().nanoseconds
-
-        if self._block_start_ns is None:
-            # Eerste blokkade — wacht 2 minuten zodat mensen de tijd hebben om aan de kant te gaan
-            self._block_start_ns = now_ns
-            self.get_logger().warn(
-                f'Weg geblokkeerd bij waypoint {self._current_waypoint + 1} — '
-                f'wacht {int(FIRST_WAIT_SEC / 60)} minuten voor eerste herpoging')
-            self._set_state(State.BLOCKED)
-            self._retry_timer = self.create_timer(FIRST_WAIT_SEC, self._on_retry_timer)
-            return
-
-        elapsed = (now_ns - self._block_start_ns) / 1e9
-
-        if elapsed >= BLOCK_TIMEOUT_SEC:
-            self.get_logger().warn(
-                f'{int(BLOCK_TIMEOUT_SEC / 60)} minuten verstreken — '
-                f'rijdt terug naar vorig waypoint {self._current_waypoint}')
-            self._block_start_ns = None
-            self._retreating     = True
-            self._set_state(State.PLANNING)
-            self._navigate_to_previous()
-        else:
-            remaining = int(BLOCK_TIMEOUT_SEC - elapsed)
-            self.get_logger().info(
-                f'Nog {remaining}s wachten — opnieuw proberen over {int(RETRY_INTERVAL_SEC)}s')
-            self._retry_timer = self.create_timer(
-                RETRY_INTERVAL_SEC, self._on_retry_timer)
-
-    def _on_next_timer(self):
-        self._cancel_timers()
-        if not self._stop_requested:
-            self._set_state(State.DRIVING)
-            self._navigate_to_next()
-
-    def _on_retry_timer(self):
-        self._cancel_timers()
-        if not self._stop_requested:
-            self.get_logger().info(
-                f'Opnieuw proberen waypoint {self._current_waypoint + 1}...')
-            self._navigate_to_next()
+    # ── Hulpfuncties ──────────────────────────────────────────────────────────
 
     def _make_pose(self, x: float, y: float, yaw: float) -> PoseStamped:
         pose                    = PoseStamped()
         pose.header.frame_id    = 'map'
-        pose.header.stamp       = rclpy.time.Time().to_msg()
+        pose.header.stamp       = self.get_clock().now().to_msg()
         pose.pose.position.x    = x
         pose.pose.position.y    = y
         pose.pose.position.z    = 0.0
