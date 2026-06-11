@@ -3,6 +3,7 @@ import signal
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Bool, String
@@ -30,17 +31,23 @@ class PatrolNode(Node):
         self._action_client  = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._state_pub      = self.create_publisher(String, '/patrol_state',     10)
         self._buzzer_pub     = self.create_publisher(Bool,   '/buzzer',           10)
-        self._planner_pub    = self.create_publisher(String, '/planner_selector', 10)
+
+        # PlannerSelector van Nav2 luistert met TRANSIENT_LOCAL durability;
+        # de publisher moet dat ook zijn anders komt het bericht nooit aan.
+        # Latching zorgt er ook voor dat Nav2 na een herstart het bericht alsnog krijgt.
+        planner_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self._planner_pub = self.create_publisher(String, '/planner_selector', planner_qos)
 
         self.create_subscription(Bool, '/start_patrol', self._on_start, 10)
         self.create_subscription(Bool, '/stop_patrol',  self._on_stop,  10)
 
-        # Zorg dat GridBased planner actief is (overschrijft AMR manager's Waypoint)
-        self._planner_timer = self.create_timer(1.0, self._publish_planner_once)
+        # GridBased planner activeren (overschrijft AMR manager's Waypoint planner)
+        self._select_gridbased_planner()
 
         self._waypoints = [
-            self._make_pose(1.0, 1.0, 0.0),   # startpunt
+            self._make_pose(0.0, 0.0, 0.0),   # startpunt
             self._make_pose(1.0,  0.0,  0.0),   # waypoint 1
+            self._make_pose(0.0,  3.0,  0.0),
             self._make_pose(0.0, 0.0, 0.0),   # terug naar start
         ]
 
@@ -54,11 +61,10 @@ class PatrolNode(Node):
         self._publish_state()
         self.get_logger().info('PatrolNode klaar — wacht op /start_patrol')
 
-    def _publish_planner_once(self):
+    def _select_gridbased_planner(self):
         msg      = String()
         msg.data = 'GridBased'
         self._planner_pub.publish(msg)
-        self.destroy_timer(self._planner_timer)
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -83,6 +89,7 @@ class PatrolNode(Node):
             self.get_logger().warn(f'Start genegeerd — robot is momenteel: {self._state}')
             return
         self.get_logger().info('Startsignaal ontvangen — route wordt gestart')
+        self._select_gridbased_planner()
         self._current_index       = 0
         self._last_successful_idx = 0
         self._stopped             = False
@@ -98,10 +105,11 @@ class PatrolNode(Node):
             self._cancel_goal()
 
     def _cancel_goal(self):
+        # Async annuleren — niet wachten met spin_until_future_complete:
+        # spinnen binnen een callback kan de executor laten vastlopen.
         if self._goal_handle is not None:
-            cancel_future     = self._goal_handle.cancel_goal_async()
+            self._goal_handle.cancel_goal_async()
             self._goal_handle = None
-            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=2.0)
 
     def _cancel_wait_timer(self):
         if self._wait_timer is not None:

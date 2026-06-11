@@ -57,8 +57,8 @@ class IndicatorNode(Node):
         prev_state         = self._patrol_state
         self._patrol_state = msg.data
 
-        # Eén piep bij overgang naar geblokkeerd, gestopt of fout
-        if msg.data in ('geblokkeerd', 'gestopt', 'fout') and msg.data != prev_state:
+        # Eén piep bij overgang naar gestopt of fout
+        if msg.data in ('gestopt', 'fout') and msg.data != prev_state:
             self._beep()
 
         # Indicatoren uitzetten als de robot niet meer rijdt
