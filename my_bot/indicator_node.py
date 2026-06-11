@@ -54,7 +54,12 @@ class IndicatorNode(Node):
     # ── Patrol staat bijhouden ──
     def _on_patrol_state(self, msg: String):
         """Ontvang de staat van de PatrolNode via /patrol_state."""
+        prev_state         = self._patrol_state
         self._patrol_state = msg.data
+
+        # Eén piep bij overgang naar geblokkeerd, gestopt of fout
+        if msg.data in ('geblokkeerd', 'gestopt', 'fout') and msg.data != prev_state:
+            self._beep()
 
         # Indicatoren uitzetten als de robot niet meer rijdt
         inactive_states = ('idle', 'voltooid', 'gestopt', 'planning')
@@ -177,6 +182,20 @@ class IndicatorNode(Node):
         indicator_msg.data = 'gevaar' if self._hazard_on else 'uit'
         self._indicator_pub.publish(indicator_msg)
 
+
+    # ── Korte piep ──
+    def _beep(self):
+        on_msg      = Bool()
+        on_msg.data = True
+        self._buzzer_pub.publish(on_msg)
+
+        def _stop():
+            off_msg      = Bool()
+            off_msg.data = False
+            self._buzzer_pub.publish(off_msg)
+            self.destroy_timer(t)
+
+        t = self.create_timer(0.3, _stop)
 
     # ── Buzzer en knipperlicht aanzetten ──
     def _activate(self, direction: str):

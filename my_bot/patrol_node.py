@@ -27,16 +27,21 @@ class PatrolNode(Node):
         super().__init__('patrol_node')
 
         self._state = State.IDLE
-        self._action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
-        self._state_pub = self.create_publisher(String, '/patrol_state', 10)
+        self._action_client  = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._state_pub      = self.create_publisher(String, '/patrol_state',     10)
+        self._buzzer_pub     = self.create_publisher(Bool,   '/buzzer',           10)
+        self._planner_pub    = self.create_publisher(String, '/planner_selector', 10)
 
         self.create_subscription(Bool, '/start_patrol', self._on_start, 10)
         self.create_subscription(Bool, '/stop_patrol',  self._on_stop,  10)
 
+        # Zorg dat GridBased planner actief is (overschrijft AMR manager's Waypoint)
+        self._planner_timer = self.create_timer(1.0, self._publish_planner_once)
+
         self._waypoints = [
-            self._make_pose(-0.5, -0.5, 0.0),   # startpunt
+            self._make_pose(1.0, 1.0, 0.0),   # startpunt
             self._make_pose(1.0,  0.0,  0.0),   # waypoint 1
-            self._make_pose(-0.5, -0.5, 0.0),   # terug naar start
+            self._make_pose(0.0, 0.0, 0.0),   # terug naar start
         ]
 
         self._current_index       = 0
@@ -48,6 +53,12 @@ class PatrolNode(Node):
 
         self._publish_state()
         self.get_logger().info('PatrolNode klaar — wacht op /start_patrol')
+
+    def _publish_planner_once(self):
+        msg      = String()
+        msg.data = 'GridBased'
+        self._planner_pub.publish(msg)
+        self.destroy_timer(self._planner_timer)
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -189,7 +200,7 @@ class PatrolNode(Node):
 
         self.get_logger().info(
             f'Terugkeren naar waypoint {self._last_successful_idx + 1}')
-        self._set_state(State.RETURNING)
+        self._set_state(State.DRIVING)
         future = self._action_client.send_goal_async(goal)
         future.add_done_callback(self._on_return_response)
 
