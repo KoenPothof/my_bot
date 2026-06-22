@@ -61,8 +61,16 @@ class IndicatorNode(Node):
         if msg.data in ('gestopt', 'wachten', 'fout') and msg.data != prev_state:
             self._beep()
 
-        # Indicatoren uitzetten als de robot niet meer rijdt
-        inactive_states = ('idle', 'voltooid', 'gestopt', 'planning')
+        # Bij het verlaten van een hazard-stand (fout/voltooid): gevaarslichten uitzetten
+        if prev_state in ('fout', 'voltooid') and msg.data not in ('fout', 'voltooid'):
+            self._hazard_on = False
+            off_msg      = String()
+            off_msg.data = 'uit'
+            self._indicator_pub.publish(off_msg)
+
+        # Indicatoren uitzetten als de robot niet meer rijdt.
+        # 'voltooid' staat hier NIET bij — daar laten we juist de gevaarslichten knipperen.
+        inactive_states = ('idle', 'gestopt', 'planning')
         if self._patrol_state in inactive_states and self._detour_active:
             self.get_logger().info(
                 f'Patrol staat: {self._patrol_state} — indicatoren uit')
@@ -87,7 +95,6 @@ class IndicatorNode(Node):
                 indicator_msg      = String()
                 indicator_msg.data = 'uit'
                 self._indicator_pub.publish(indicator_msg)
-                self.get_logger().info('Gevaarslichten UIT — robot rijdt weer')
 
 
     #  Bocht detecteren via rijcommando 
@@ -163,8 +170,17 @@ class IndicatorNode(Node):
         return False, 'uit'
 
 
-    #  Gevaarslichten knipperen wanneer robot stilstaat 
+    #  Gevaarslichten knipperen wanneer robot stilstaat
     def _blink_hazard(self):
+        # Foutmodus én voltooide route: gevaarslichten blijven knipperen
+        # (in 'fout' als hulpsignaal, in 'voltooid' om aan te geven dat de route klaar is).
+        if self._patrol_state in ('fout', 'voltooid'):
+            self._hazard_on = not self._hazard_on
+            indicator_msg      = String()
+            indicator_msg.data = 'gevaar' if self._hazard_on else 'uit'
+            self._indicator_pub.publish(indicator_msg)
+            return
+
         actief_rijdend = self._patrol_state in ('rijdend', 'wachten')
 
         if self._still_since is None or self._detour_active or not actief_rijdend:
@@ -197,24 +213,11 @@ class IndicatorNode(Node):
 
         t = self.create_timer(0.3, _stop)
 
-    # Buzzer en knipperlicht aanzetten
+    # Knipperlicht aanzetten (géén buzzer meer bij bochten)
     def _activate(self, direction: str):
         self._detour_active = True
         self._direction     = direction
         self._activated_at  = self.get_clock().now()
-
-        # Buzzer kort aan — timer zet hem na 0.3s weer uit
-        buzzer_msg      = Bool()
-        buzzer_msg.data = True
-        self._buzzer_pub.publish(buzzer_msg)
-
-        def _stop_buzzer():
-            off_msg      = Bool()
-            off_msg.data = False
-            self._buzzer_pub.publish(off_msg)
-            self.destroy_timer(buzzer_timer)
-
-        buzzer_timer = self.create_timer(0.3, _stop_buzzer)
 
         indicator_msg      = String()
         indicator_msg.data = direction
@@ -235,10 +238,6 @@ class IndicatorNode(Node):
         self._detour_active = False
         self._direction     = 'uit'
         self._activated_at  = None
-
-        buzzer_msg      = Bool()
-        buzzer_msg.data = False
-        self._buzzer_pub.publish(buzzer_msg)
 
         indicator_msg      = String()
         indicator_msg.data = 'uit'

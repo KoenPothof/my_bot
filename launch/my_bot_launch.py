@@ -22,13 +22,8 @@ def generate_launch_description():
             on_exit=Shutdown(),
         ),
 
-        Node(
-            package='my_bot',
-            executable='environment_speed_node.py',
-            name='environment_speed_node',
-            output='screen',
-            on_exit=Shutdown(),
-        ),
+        # environment_speed_node uitgeschakeld: de 0.2 m/s-limiet bij bochten
+        # liet de robot kruipen en hielp niet. DWB regelt zelf de bochtsnelheid.
 
         Node(
             package='my_bot',

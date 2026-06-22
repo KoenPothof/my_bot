@@ -18,8 +18,9 @@ WACHT_SECONDEN  = 120  # 2 minuten wachten bij blokkade
 NAV_TIMEOUT_SEC = 60   # seconden per waypoint zonder voortgang → fout
 PERSOON_WACHT_SECONDEN = 120
 BACKUP_SPEED    = 0.1
-BACKUP_DISTANCE = 0.3
+BACKUP_DISTANCE = 0.5   # m — afstand achteruit na de 2-min wachttijd (was 0.3)
 BACKUP_CMD_VEL_TOPIC = '/cmd_vel'
+RENAV_PAUSE     = 2.0   # s — pauze tussen oud doel annuleren en nieuw doel sturen
 
 
 class State:
@@ -38,12 +39,11 @@ class PatrolNode(Node):
 
         self._state = State.IDLE
 
-        # Hoofdnavigatie: NavigateThroughPoses (alle waypoints in één goal)
+        # Hoofdnavigatie: NavigateThroughPoses (alle waypoints in één goal).
         self._action_client = ActionClient(
             self, NavigateThroughPoses, 'navigate_through_poses')
         # Terugkeer: NavigateToPose (één waypoint)
-        self._return_client = ActionClient(
-            self, NavigateToPose, 'navigate_to_pose')
+        self._return_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         self._state_pub     = self.create_publisher(String, '/patrol_state', 10)
         self._buzzer_pub    = self.create_publisher(Bool,   '/buzzer',       10)
@@ -52,19 +52,28 @@ class PatrolNode(Node):
         planner_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self._planner_pub = self.create_publisher(String, '/planner_selector', planner_qos)
 
-        self.create_subscription(Bool, '/start_patrol', self._on_start, 10)
-        self.create_subscription(Bool, '/stop_patrol',  self._on_stop,  10)
+        self.create_subscription(Bool, '/start_patrol',   self._on_start,   10)
+        self.create_subscription(Bool, '/start_patrol_2', self._on_start_2, 10)
+        self.create_subscription(Bool, '/stop_patrol',    self._on_stop,    10)
 
         self._select_gridbased_planner()
 
-        self._waypoints = [
+        # Route 1 — knop 1 → /start_patrol
+        self._route1 = [
             self._make_pose(7.66, -3.49, 0.0),
-            self._make_pose(5.59, -3.49, 0.0),
-            self._make_pose(6.59, 2.49, 0.0),
-            self._make_pose(5.66, 2.036, 0.0),
+            self._make_pose(5.48, -0.6, 0.0),
+            self._make_pose(7.0, 2.9, 0.0),
         ]
+        # Route 2 — knop 2 → /start_patrol_2.  PAS DEZE WAYPOINTS AAN naar je tweede route.
+        # (placeholder: nu route 1 in omgekeerde volgorde)
+        self._route2 = [
+            self._make_pose(7.0, 2.9, 0.0),
+            self._make_pose(5.48, -0.6, 0.0),
+            self._make_pose(7.66, -3.49, 0.0),
+        ]
+        self._waypoints = self._route1   # actieve route; wordt bij elke start gezet
 
-        # Cancel services: navigate_through_poses (huidig) + navigate_to_pose (legacy)
+        # Cancel-services: ruim zombie-doelen op van beide action servers.
         self._cancel_ntps_client = self.create_client(
             CancelGoal, '/navigate_through_poses/_action/cancel_goal')
         self._cancel_ntp_client = self.create_client(
@@ -86,6 +95,7 @@ class PatrolNode(Node):
         self._route_start_index   = 0  # index waarbij de actieve NavigateThroughPoses begon
         self._last_successful_idx = 0
         self._goal_handle         = None
+        self._goal_seq            = 0  # volgnummer: resultaten van oude doelen negeren we
         self._stopped             = False
         self._wait_timer          = None
         self._trying_alternative  = False
@@ -133,14 +143,22 @@ class PatrolNode(Node):
     # ── Start / stop ──────────────────────────────────────────────────────────
 
     def _on_start(self, msg: Bool):
-        if not msg.data:
-            return
+        if msg.data:
+            self._begin_route(1, self._route1)
+
+    def _on_start_2(self, msg: Bool):
+        if msg.data:
+            self._begin_route(2, self._route2)
+
+    def _begin_route(self, route_id: int, waypoints):
         valid_start_states = (State.IDLE, State.COMPLETED, State.STOPPED, State.ERROR)
         if self._state not in valid_start_states:
             self.get_logger().warn(f'Start genegeerd — robot is momenteel: {self._state}')
             return
-        # Altijd vanaf het begin: geen voortgang onthouden tussen sessies.
-        self.get_logger().info('Startsignaal ontvangen — route start bij waypoint 1')
+        # Kies de route en start altijd vanaf het begin (geen voortgang onthouden).
+        self._waypoints = waypoints
+        self.get_logger().info(f'Startsignaal route {route_id} ontvangen — start bij waypoint 1')
+        self._reset_timers_and_flags()   # schone lei: oude timers/achteruit-vlag opruimen
         self._select_gridbased_planner()
         self._current_index       = 0
         self._route_start_index   = 0
@@ -151,7 +169,7 @@ class PatrolNode(Node):
         self._cancel_all_nav2_goals()
 
     def _cancel_all_nav2_goals(self):
-        """Cancel actieve doelen op beide action servers."""
+        """Cancel actieve doelen op beide action servers, daarna controller resetten."""
         pending = [0]
 
         def _on_done(future, name):
@@ -215,19 +233,37 @@ class PatrolNode(Node):
             self._pending_start_timer = None
         if self._stopped:
             return
-        self.get_logger().info('Zombie-doelen verwerkt — route wordt gestart')
+        self.get_logger().info('Doelen verwerkt — route wordt gestart')
         self._navigate_through_remaining()
+
+    def _schedule_return(self, delay: float = RENAV_PAUSE):
+        """Plan een terugkeer-poging nadat het oude doel is geannuleerd."""
+        if self._pending_start_timer is not None:
+            self._pending_start_timer.cancel()
+        self._pending_start_timer = self.create_timer(delay, self._do_return)
+
+    def _do_return(self):
+        if self._pending_start_timer is not None:
+            self._pending_start_timer.cancel()
+            self._pending_start_timer = None
+        if self._stopped:
+            return
+        self._return_to_last()
 
     def _on_stop(self, msg: Bool):
         if msg.data and self._state not in (State.IDLE, State.STOPPED, State.COMPLETED, State.ERROR):
             self.get_logger().info('Stopsignaal ontvangen — route wordt onderbroken')
             self._stopped = True
-            self._cancel_wait_timer()
-            self._cancel_safety_wait_timer()
+            self._reset_timers_and_flags()
             self._set_state(State.STOPPED)
             self._cancel_goal()
 
     def _cancel_goal(self):
+        """Annuleer het actieve doel en hoog het volgnummer op, zodat een laat
+        binnenkomend (CANCELED/ABORTED) resultaat van dit doel ALTIJD door de
+        seq-guard verworpen wordt — ongeacht de huidige state. Voorkomt dat een
+        escalatietrap dubbel of overgeslagen wordt."""
+        self._goal_seq += 1
         if self._goal_handle is not None:
             self._goal_handle.cancel_goal_async()
             self._goal_handle = None
@@ -249,11 +285,11 @@ class PatrolNode(Node):
             self._wait_timer.cancel()
             self._wait_timer = None
 
-    # ── Navigatie ─────────────────────────────────────────────────────────────
+    # ── Navigatie (alle resterende waypoints in één goal) ──────────────────────
 
     def _navigate_through_remaining(self):
         """Stuur waypoints vanaf _current_index als één NavigateThroughPoses goal.
-        Nav2 navigeert er continu doorheen zonder tussenstops."""
+        Elk nieuw doel krijgt een nieuw volgnummer; oude doelen negeren we."""
         if not self._action_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error(
                 'Nav2 navigate_through_poses niet beschikbaar na 5 seconden')
@@ -269,6 +305,9 @@ class PatrolNode(Node):
         goal.poses = remaining_poses
         self._route_start_index = self._current_index
 
+        self._goal_seq += 1
+        seq = self._goal_seq
+
         label = 'alternatief' if self._trying_alternative else 'route'
         self.get_logger().info(
             f'Stuur {label}: {len(remaining_poses)} waypoints '
@@ -277,7 +316,7 @@ class PatrolNode(Node):
         self._set_indicator('uit')   # eventuele gevaarslichten uit nu we weer rijden
         future = self._action_client.send_goal_async(
             goal, feedback_callback=self._on_feedback)
-        future.add_done_callback(self._on_goal_response)
+        future.add_done_callback(lambda f: self._on_goal_response(f, seq))
 
     def _on_feedback(self, feedback_msg):
         """Reset de per-waypoint timeout telkens als een waypoint gepasseerd wordt."""
@@ -291,11 +330,17 @@ class PatrolNode(Node):
             self._current_index = new_index
             self._last_successful_idx = old
             self._driving_since = self.get_clock().now()  # reset timeout per waypoint
+            # Voortgang geboekt → blokkade voorbij: escalatieladder terug naar nul,
+            # zodat een vólgend obstakel weer de volledige keten krijgt (wacht → achteruit → ...).
+            self._blockage_level     = 0
+            self._trying_alternative = False
             self.get_logger().info(
                 f'Waypoint {old + 1} gepasseerd → navigeert naar {self._current_index + 1} '
                 f'({remaining} resterend)')
 
-    def _on_goal_response(self, future):
+    def _on_goal_response(self, future, seq):
+        if seq != self._goal_seq:
+            return  # verouderd doel — er is al een nieuwer doel gestuurd
         goal_handle = future.result()
         if not goal_handle.accepted:
             retries = getattr(self, '_goal_retries', 0)
@@ -311,25 +356,29 @@ class PatrolNode(Node):
             return
         self._goal_retries = 0
         self._goal_handle = goal_handle
-        future = goal_handle.get_result_async()
-        future.add_done_callback(self._on_result)
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(lambda f: self._on_result(f, seq))
 
-    def _on_result(self, future):
-        if self._stopped or self._backing_up:
+    def _on_result(self, future, seq):
+        # Negeer resultaten van oude doelen, of als we gestopt/achteruit/fout/wachten zijn.
+        # (Bij het ingaan van 'wachten' annuleren we het doel; dat CANCELED-resultaat
+        #  mag de blokkade-afhandeling niet opnieuw triggeren.)
+        if seq != self._goal_seq:
+            return
+        if self._stopped or self._backing_up or self._state in (State.ERROR, State.WAITING):
             return
 
         status = future.result().status
 
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('Volledige route succesvol afgerond! Herstart de lus.')
+            self.get_logger().info('Volledige route voltooid — robot stopt, gevarenlichten aan.')
             self._last_successful_idx = len(self._waypoints) - 1
             self._trying_alternative  = False
             self._blockage_level      = 0
-            self._set_state(State.WAITING)
-            # Loop: begin opnieuw bij waypoint 1
-            self._current_index     = 0
-            self._route_start_index = 0
-            self._schedule_start_navigation(delay=2.0)
+            # Geen herstart: naar 'voltooid', stilstaan en gevarenlichten aan.
+            self._set_state(State.COMPLETED)
+            self._cmdvel_pub.publish(Twist())   # zeker stilstaan
+            self._set_indicator('gevaar')        # gevarenlichten aan (indicator_node blijft knipperen)
         else:
             self.get_logger().warn(
                 f'Nav2 route mislukt — status: {status} '
@@ -346,6 +395,7 @@ class PatrolNode(Node):
                 f'Blokkade bij waypoint {self._current_index + 1} — '
                 f'wacht {WACHT_SECONDEN // 60} min op vrije doorgang')
             self._set_state(State.WAITING)
+            self._cancel_goal()   # doel annuleren → robot stopt en staat echt stil tijdens het wachten
             self._wait_timer = self.create_timer(WACHT_SECONDEN, self._on_wacht_voorbij)
         else:
             self._escalate_blockage()
@@ -363,10 +413,10 @@ class PatrolNode(Node):
         if self._blockage_level == 0:
             self.get_logger().warn('Blokkade — piep, stukje achteruit en opnieuw proberen')
             self._blockage_level = 1
-            self._cancel_goal()
+            self._cancel_goal()                 # zet het huidige pad uit
             self._beep()
-            self._set_indicator('gevaar')   # gevaarslichten aan tijdens blokkade/achteruit
-            self._start_backup()
+            self._set_indicator('gevaar')        # gevaarslichten aan tijdens blokkade/achteruit
+            self._start_backup()                 # na backup → vers pad (nieuw volgnummer)
 
         elif self._blockage_level == 1:
             self._blockage_level = 2
@@ -376,13 +426,19 @@ class PatrolNode(Node):
                     f'Nog steeds geblokkeerd — alternatieve route via waypoint {next_index + 1}')
                 self._trying_alternative = True
                 self._current_index      = next_index
-                self._navigate_through_remaining()
+                self._cancel_goal()       # oud pad uitzetten (hoogt _goal_seq op)
+                self._halt()              # robot stilzetten tijdens de pauze
+                self._schedule_start_navigation(delay=RENAV_PAUSE)  # daarna vers pad
             else:
                 self.get_logger().warn('Geen alternatief — terugkeren naar vorig waypoint')
-                self._return_to_last()
+                self._cancel_goal()
+                self._halt()
+                self._schedule_return(delay=RENAV_PAUSE)
         else:
             self.get_logger().warn('Alternatieve route ook geblokkeerd — terugkeren')
-            self._return_to_last()
+            self._cancel_goal()
+            self._halt()
+            self._schedule_return(delay=RENAV_PAUSE)
 
     def _beep(self):
         on = Bool()
@@ -401,26 +457,59 @@ class PatrolNode(Node):
 
     def _set_indicator(self, state: str):
         """Stuur de knipperlichten direct aan, net als de buzzer via _beep().
-        Het bericht gaat via /indicators → mqtt_hmi_bridge → MQTT → HMI (Q01/Q02).
+        Het bericht gaat via /indicators → mqtt_hmi_bridge → MQTT → HMI (lamp_links/rechts).
         state: 'links', 'rechts', 'gevaar' (beide) of 'uit'."""
         msg = String()
         msg.data = state
         self._indicator_pub.publish(msg)
 
+    def _halt(self):
+        """Zet de robot stil tijdens een herplan-pauze: state op WAITING + één
+        nul-snelheid commando, zodat hij óók bij alternatief/terugkeren echt stilstaat."""
+        self._set_state(State.WAITING)
+        self._cmdvel_pub.publish(Twist())
+
+    def _reset_timers_and_flags(self):
+        """Schone lei bij start/stop: alle lopende timers stoppen, vlaggen resetten
+        en de wielen stilzetten. Voorkomt dat een oude run of een achteruit-actie
+        blijft hangen (bv. _backing_up dat True blijft → permanent vastlopen)."""
+        for t in (self._wait_timer, self._pending_start_timer, self._backup_timer,
+                  self._beep_timer, self._safety_wait_timer):
+            if t is not None:
+                t.cancel()
+        self._wait_timer         = None
+        self._pending_start_timer = None
+        self._backup_timer       = None
+        self._beep_timer         = None
+        self._safety_wait_timer  = None
+        self._backing_up         = False
+        self._goal_retries       = 0
+        self._cmdvel_pub.publish(Twist())
+
     # ── Terugkeren ────────────────────────────────────────────────────────────
 
     def _return_to_last(self):
+        if not self._return_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Nav2 navigate_to_pose niet beschikbaar — kan niet terugkeren')
+            self._set_state(State.ERROR)
+            return
+
         goal = NavigateToPose.Goal()
         goal.pose = self._waypoints[self._last_successful_idx]
         goal.pose.header.stamp = self.get_clock().now().to_msg()
+
+        self._goal_seq += 1
+        seq = self._goal_seq
 
         self.get_logger().info(
             f'Terugkeren naar waypoint {self._last_successful_idx + 1}')
         self._set_state(State.DRIVING)
         future = self._return_client.send_goal_async(goal)
-        future.add_done_callback(self._on_return_response)
+        future.add_done_callback(lambda f: self._on_return_response(f, seq))
 
-    def _on_return_response(self, future):
+    def _on_return_response(self, future, seq):
+        if seq != self._goal_seq:
+            return
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error(
@@ -428,10 +517,12 @@ class PatrolNode(Node):
             self._set_state(State.ERROR)
             return
         self._goal_handle = goal_handle
-        future = goal_handle.get_result_async()
-        future.add_done_callback(self._on_return_result)
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(lambda f: self._on_return_result(f, seq))
 
-    def _on_return_result(self, future):
+    def _on_return_result(self, future, seq):
+        if seq != self._goal_seq:
+            return
         if future.result().status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().error(
                 'FOUT: Route mislukt — robot teruggekeerd — operator ingrijpen vereist')
@@ -526,7 +617,7 @@ class PatrolNode(Node):
             self._backup_timer = None
         self._backing_up = False
         if not self._stopped:
-            self.get_logger().info('Achteruit klaar — route hervatten')
+            self.get_logger().info('Achteruit klaar — vers pad sturen')
             self._navigate_through_remaining()
 
     # ── Hulpfuncties ──────────────────────────────────────────────────────────
