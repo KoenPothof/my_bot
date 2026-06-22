@@ -13,7 +13,10 @@ SPEED_TURN          = 0.2   # m/s — snelheid bij scherpe bocht
 
 # Bocht detectie (zelfde methode als indicator_node)
 TURN_THRESHOLD_DEGREES = 45.0  # graden — minimale hoekverandering voor scherpe bocht
-LOOKAHEAD_FRACTION     = 0.6   # eerste 60% van het pad bekijken
+LOOKAHEAD_DISTANCE     = 2.0   # m — alleen de eerstvolgende ~2 m vooruit bekijken
+                               # (niet een fractie van het hele pad: bij NavigateThroughPoses
+                               #  bevat het pad alle waypoints, dus een verre bocht zou de
+                               #  snelheid anders permanent op SPEED_TURN vastzetten)
 
 
 class EnvironmentSpeedNode(Node):
@@ -63,10 +66,12 @@ class EnvironmentSpeedNode(Node):
 
 
     def _detect_turn(self, path: Path):
-        poses     = path.poses
-        n         = len(poses)
-        lookahead = max(3, int(n * LOOKAHEAD_FRACTION))
-        poses     = poses[:lookahead]
+        # Neem alleen de poses binnen LOOKAHEAD_DISTANCE meter vanaf de robot,
+        # zodat een verre bocht (verderop in een meervoudig-waypoint pad) de
+        # snelheid niet onterecht blijft verlagen.
+        poses = self._poses_within_distance(path.poses, LOOKAHEAD_DISTANCE)
+        if len(poses) < 3:
+            return False, None
 
         start  = poses[0].pose.position
         middle = poses[len(poses) // 2].pose.position
@@ -83,6 +88,21 @@ class EnvironmentSpeedNode(Node):
             return True, direction
 
         return False, None
+
+    def _poses_within_distance(self, poses, max_dist: float):
+        """Geef de poses terug tot er max_dist meter pad is afgelegd vanaf het begin."""
+        if not poses:
+            return []
+        window   = [poses[0]]
+        traveled = 0.0
+        for prev, cur in zip(poses, poses[1:]):
+            dx = cur.pose.position.x - prev.pose.position.x
+            dy = cur.pose.position.y - prev.pose.position.y
+            traveled += math.hypot(dx, dy)
+            window.append(cur)
+            if traveled >= max_dist:
+                break
+        return window
 
 
     def _set_speed(self, speed: float):

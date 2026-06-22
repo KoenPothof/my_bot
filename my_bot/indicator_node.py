@@ -51,14 +51,14 @@ class IndicatorNode(Node):
         self.get_logger().info('IndicatorNode gestart — wacht op /patrol_state')
 
 
-    # ── Patrol staat bijhouden ──
+    #  Patrol staat bijhouden 
     def _on_patrol_state(self, msg: String):
         """Ontvang de staat van de PatrolNode via /patrol_state."""
         prev_state         = self._patrol_state
         self._patrol_state = msg.data
 
-        # Eén piep bij overgang naar gestopt of fout
-        if msg.data in ('gestopt', 'fout') and msg.data != prev_state:
+        # Eén piep bij overgang naar gestopt, wachten of fout
+        if msg.data in ('gestopt', 'wachten', 'fout') and msg.data != prev_state:
             self._beep()
 
         # Indicatoren uitzetten als de robot niet meer rijdt
@@ -69,7 +69,7 @@ class IndicatorNode(Node):
             self._deactivate()
 
 
-    # ── Huidige snelheid bijhouden via odometrie ──
+    #  Huidige snelheid bijhouden via odometrie 
     def _on_odom(self, msg: Odometry):
         """Bereken de werkelijke rijsnelheid van de robot."""
         vx = msg.twist.twist.linear.x
@@ -90,7 +90,7 @@ class IndicatorNode(Node):
                 self.get_logger().info('Gevaarslichten UIT — robot rijdt weer')
 
 
-    # ── Bocht detecteren via rijcommando ──
+    #  Bocht detecteren via rijcommando 
     def _on_cmd_vel(self, msg: Twist):
         """Detecteer bochten op basis van de rotatiesnelheid in /cmd_vel."""
         if self._patrol_state != 'rijdend':
@@ -111,7 +111,7 @@ class IndicatorNode(Node):
             self._deactivate()
 
 
-    # ── Omweg detecteren via gepland pad ──
+    #  Omweg detecteren via gepland pad 
     def _on_plan(self, msg: Path):
         """Detecteer omwegen op basis van het geplande pad van Nav2."""
         if self._patrol_state != 'rijdend':
@@ -129,7 +129,7 @@ class IndicatorNode(Node):
                 self._activate(direction)
 
 
-    # ── Hoekverandering berekenen langs het pad ──
+    #  Hoekverandering berekenen langs het pad 
     def _calculate_detour(self, path: Path):
         """
         Bepaal of het pad een significante bocht maakt en in welke richting.
@@ -163,7 +163,7 @@ class IndicatorNode(Node):
         return False, 'uit'
 
 
-    # ── Gevaarslichten knipperen wanneer robot stilstaat ──
+    #  Gevaarslichten knipperen wanneer robot stilstaat 
     def _blink_hazard(self):
         actief_rijdend = self._patrol_state in ('rijdend', 'wachten')
 
@@ -175,15 +175,15 @@ class IndicatorNode(Node):
             return
 
         self._hazard_on = not self._hazard_on
-        status = 'AAN' if self._hazard_on else 'UIT'
-        self.get_logger().info(f'Gevaarslichten {status} — robot staat stil')
+        self.get_logger().debug(
+            f'Gevaarslichten {"AAN" if self._hazard_on else "UIT"} — robot staat stil')
 
         indicator_msg      = String()
         indicator_msg.data = 'gevaar' if self._hazard_on else 'uit'
         self._indicator_pub.publish(indicator_msg)
 
 
-    # ── Korte piep ──
+    #  Korte piep 
     def _beep(self):
         on_msg      = Bool()
         on_msg.data = True
@@ -193,11 +193,11 @@ class IndicatorNode(Node):
             off_msg      = Bool()
             off_msg.data = False
             self._buzzer_pub.publish(off_msg)
-            self.destroy_timer(t)
+            t.cancel()
 
         t = self.create_timer(0.3, _stop)
 
-    # ── Buzzer en knipperlicht aanzetten ──
+    # Buzzer en knipperlicht aanzetten
     def _activate(self, direction: str):
         self._detour_active = True
         self._direction     = direction
@@ -224,7 +224,7 @@ class IndicatorNode(Node):
             f'Knipperlicht {direction.upper()} AAN — robot maakt bocht naar {direction}')
 
 
-    # ── Buzzer en knipperlicht uitzetten ──
+    # Buzzer en knipperlicht uitzetten 
     def _deactivate(self):
         # Wacht minimaal MIN_BLINKER_DURATION seconden voor uitzetten
         if self._activated_at is not None:
@@ -247,7 +247,7 @@ class IndicatorNode(Node):
         self.get_logger().info('Knipperlicht UIT')
 
 
-    # ── Huidige status publiceren voor monitoring ──
+    # Huidige status publiceren voor monitoring
     def _publish_status(self):
         """Publiceer de huidige staat voor monitoring via /indicator_status."""
         status_msg      = String()

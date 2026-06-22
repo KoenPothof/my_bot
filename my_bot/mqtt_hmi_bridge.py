@@ -12,7 +12,11 @@ MQTT_TOPIC_STOP     = 'robot/stop_patrol'     # payload "1" = stoppen
 # MQTT topics waarop de robot status terugstuurt naar de HMI
 MQTT_TOPIC_STATE             = 'robot/patrol_state'
 MQTT_TOPIC_INDICATOR_STATUS  = 'robot/indicator_status'
-MQTT_TOPIC_BUZZER            = 'robot/buzzer'
+MQTT_TOPIC_BUZZER            = 'robot/outputs/buzzer'
+
+# HMI-uitgangen voor de knipperlichten (net als de buzzer een output)
+MQTT_TOPIC_INDICATOR_LEFT    = 'robot/outputs/lamp_links'   # linker knipperlicht
+MQTT_TOPIC_INDICATOR_RIGHT   = 'robot/outputs/lamp_rechts'  # rechter knipperlicht
 
 
 class MqttHmiBridge(Node):
@@ -20,7 +24,7 @@ class MqttHmiBridge(Node):
     def __init__(self):
         super().__init__('mqtt_hmi_bridge')
 
-        self.declare_parameter('broker_host', '10.1.0.2')
+        self.declare_parameter('broker_host', 'localhost')
         self.declare_parameter('broker_port', 1883)
 
         broker_host = self.get_parameter('broker_host').get_parameter_value().string_value
@@ -34,6 +38,7 @@ class MqttHmiBridge(Node):
         self.create_subscription(String, '/patrol_state',     self._on_patrol_state,     10)
         self.create_subscription(String, '/indicator_status', self._on_indicator_status, 10)
         self.create_subscription(Bool,   '/buzzer',           self._on_buzzer,           10)
+        self.create_subscription(String, '/indicators',       self._on_indicators,       10)
 
         # MQTT client opzetten
         self._mqtt = mqtt.Client(client_id='ros2_bridge')
@@ -88,6 +93,15 @@ class MqttHmiBridge(Node):
 
     def _on_buzzer(self, msg: Bool):
         self._mqtt.publish(MQTT_TOPIC_BUZZER, '1' if msg.data else '0')
+
+    def _on_indicators(self, msg: String):
+        """Zet het knipperlicht-commando om naar de HMI-uitgangen Q01 (links)
+        en Q02 (rechts). 'gevaar' = beide aan, 'uit' = beide uit."""
+        state = msg.data
+        left  = state in ('links', 'gevaar')
+        right = state in ('rechts', 'gevaar')
+        self._mqtt.publish(MQTT_TOPIC_INDICATOR_LEFT,  '1' if left  else '0')
+        self._mqtt.publish(MQTT_TOPIC_INDICATOR_RIGHT, '1' if right else '0')
 
     def destroy_node(self):
         self._mqtt.loop_stop()

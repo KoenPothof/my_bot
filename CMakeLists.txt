@@ -42,6 +42,7 @@ install(PROGRAMS
   my_bot/indicator_node.py
   my_bot/environment_speed_node.py
   my_bot/mqtt_hmi_bridge.py
+  my_bot/test_indicators.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

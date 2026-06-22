@@ -37,9 +37,19 @@ def generate_launch_description():
             output='screen',
             on_exit=Shutdown(),
             parameters=[{
-                'broker_host': '10.1.0.2',
+                'broker_host': 'localhost',
                 'broker_port': 1883,
             }],
+        ),
+
+        Node(
+            package='foxglove_bridge',
+            executable='foxglove_bridge',
+            name='foxglove_bridge',
+            output='log',
+            on_exit=Shutdown(),
+            parameters=[{'port': 8765}],
+            ros_arguments=['--log-level', 'FATAL'],
         ),
 
     ])
