@@ -53,7 +53,7 @@ class PatrolNode(Node):
         self._planner_pub = self.create_publisher(String, '/planner_selector', planner_qos)
 
         self.create_subscription(Bool, '/start_patrol',   self._on_start,   10)
-        self.create_subscription(Bool, '/start_patrol_2', self._on_start_2, 10)
+        self.create_subscription(Bool, '/start_patrol2', self._on_start_2, 10)
         self.create_subscription(Bool, '/stop_patrol',    self._on_stop,    10)
 
         self._select_gridbased_planner()
