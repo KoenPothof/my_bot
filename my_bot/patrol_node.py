@@ -70,7 +70,8 @@ class PatrolNode(Node):
             self._make_pose(7.0, 2.9, 0.0),
             self._make_pose(5.48, -0.6, 0.0),
             self._make_pose(7.66, -3.49, 0.0),
-        ]
+            self._make_pose(7.99, 3.32, 0.0),
+            ]
         self._waypoints = self._route1   # actieve route; wordt bij elke start gezet
 
         # Cancel-services: ruim zombie-doelen op van beide action servers.
